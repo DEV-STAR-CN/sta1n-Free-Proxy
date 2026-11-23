@@ -2,118 +2,334 @@
 
 > **免责声明**：本项目仅用于技术研究与个人自用，与 sta1n.ai / RP-Hub / New API 及其运营方无任何关联，仓库内不含任何 API key。上游可能将「非官方源站调用」视为违规，使用风险自负。完整条款见文末。
 
-把 sta1n.ai 的公益模型转成一个**局域网可用的 OpenAI 兼容服务**：任何客户端（脚本 / 后端 / ChatBox / OpenWebUI / LobeChat）把 base_url 指过来，就能在 RP-Hub 之外直接调用。
-纯 Python 标准库，无 pip 依赖，不需要 root。
+把一个 OpenAI 兼容的远端接口，包装成**局域网内任何设备都能用的本地服务**：手机、电脑、NAS 上的脚本、App、后端都能连。
+
+纯 Python 标准库实现，零 pip 依赖，不需要 root。
 
 ```
-/v1/models              -> 原样透传上游列表
-/v1/chat/completions    -> 转发并自动补 RP-Hub 源站头 + 503/429 退避重试
-其它路径                 -> 404（不外泄任何无关接口）
+GET  /v1/models           → 上游模型列表原样返回
+POST /v1/chat/completions → 转发（含流式 SSE），自动补齐上游要求的请求头 + 退避重试
+其它路径                    → 404，不暴露任何无关接口
 ```
 
-## 文件
+---
 
-| 文件 | 作用 |
+## 目录
+
+- [这是什么](#这是什么)
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [客户端接入](#客户端接入)
+- [配置项](#配置项)
+- [Python 环境探测](#python-环境探测)
+- [工作原理](#工作原理)
+- [错误排查](#错误排查)
+- [已知限制](#已知限制)
+- [FAQ](#faq)
+- [项目结构](#项目结构)
+- [免责声明](#免责声明--disclaimer)
+
+---
+
+## 这是什么
+
+很多第三方站点会校验请求来源，只允许自家页面调用自家 API。本项目在本地起一个转发服务：
+
+```
+你的客户端 ──► http://127.0.0.1:17392/v1 ──► 上游 API
+              （标准 OpenAI 协议）          （补齐来源头、UA、重试）
+```
+
+客户端只需要支持「自定义 Base URL」，不用改任何代码。**key 由客户端自带并原样透传，服务端不保存任何凭据。**
+
+## 特性
+
+- **零依赖**：只用 `http.server` / `http.client` / `ssl`，不需要 pip install
+- **免 root**：监听高端口，普通用户即可运行
+- **key 透传**：客户端 `Authorization` 里的 key 直接转发上游，服务端不落盘
+- **退避重试**：429/500/502/503/504 按 3/6/9/12 秒重试，`model_not_found` 立即失败不浪费次数
+- **流式支持**：`stream:true` 的 SSE 逐块透传（chunked），不等整包
+- **路径白名单**：只转发必要接口，其它一律 404
+- **响应头清洗**：上游的 `Set-Cookie`、`Server`、`X-New-Api-*` 等不留痕
+- **错误归一化**：统一成 `{"error":{message,type,code}}`
+- **自动环境探测**：`start.sh` 自己找 Python 并缓存路径
+- **局域网可用**：默认监听 `0.0.0.0`，手机、平板、电脑同网即用
+
+---
+
+## 快速开始
+
+### 1. 环境要求
+
+| 项 | 要求 |
 |---|---|
-| `sta1n_proxy.py` | 代理本体（http.server + http.client，标准库） |
-| `start.sh` | 启动脚本，自动找 python3 / 读 key / 打印局域网地址 |
-| `key.txt` | **可选**：只有当你想让服务端兜底持有一个 key 时才需要 |
-| `python_path.txt` | 自动生成：缓存探测到的 Python 路径，下次启动直接读 |
+| Python | **3.8 及以上**，必须能 `import ssl` |
+| 依赖包 | 无（纯标准库） |
+| 系统 | Android（Termux / MT管理器）、Linux、macOS 均可 |
+| root | 不需要 |
 
-## 启动
-
-Termux：
+装 Python（Termux）：
 
 ```sh
-pkg install python          # 已装可跳过
+pkg update && pkg install python
+python3 -V          # 确认 >= 3.8
+```
+
+### 2. 获取代码
+
+方式一，git：
+
+```sh
+git clone https://github.com/DEV-STAR-CN/sta1n-Free-Proxy.git
+cd sta1n-Free-Proxy
+```
+
+方式二，手机浏览器打开仓库页 → `Code` → `Download ZIP` → 解压到任意目录，例如 `/sdcard/DSH-GO/sta1n-Free-Proxy/`
+
+> `/sdcard` 是 exFAT，改不了可执行位，所以下面一律用 `sh start.sh` 调用，不要用 `./start.sh`
+
+### 3. 启动
+
+```sh
 cd /sdcard/DSH-GO/sta1n-Free-Proxy
-sh start.sh                 # 前台，Ctrl+C 停
-sh start.sh --bg            # 后台，日志 proxy.log
-sh start.sh --status        # 看状态
-sh start.sh --stop          # 停
-sh start.sh --detect        # 只探测 Python 环境，不启动
-sh start.sh --which         # 看当前用的哪个 Python、SSL 版本
-sh start.sh --reset         # 清掉 Python 缓存，下次重新找
+
+sh start.sh              # 前台运行，Ctrl+C 停止
+sh start.sh --bg         # 后台运行，日志写 proxy.log
+sh start.sh --stop       # 停止后台实例
+sh start.sh --status     # 查看是否在跑
 ```
 
-MT 管理器：进入目录 → 长按 `start.sh` → 执行 / 或用它自带的终端 `sh start.sh`。
-`/sdcard` 是 exFAT，改不了可执行位，所以一律用 `sh start.sh` 调用（不要指望 `./start.sh`）。
-
-**默认不需要在手机里存任何 key**：客户端请求头里带的 `Authorization: Bearer <你的 sta1n key>` 会被原样转发给上游。
-只有想让服务端替客户端兜底（多个客户端共用一把 key）时，才 `export KEY=sk-xxx` 或写 `key.txt`。
-
-## Python 环境探测（python_path.txt）
-
-`start.sh` 每次启动按这个顺序找 Python，找到就缓存，下次直接用：
-
-1. `PYTHON=/path/to/python3` 环境变量
-2. `python_path.txt` 里缓存的路径（顺手校验能否执行、版本是否 ≥3.8）
-3. 自动探测：PATH 里的 `python3`/`python`，再扫 Termux、MT管理器、Pydroid 等常见安装位置，最后是 `/data/local/tmp`、`/usr/bin`、`/usr/local/bin` 和本目录自带的便携版
-
-要求 Python ≥ 3.8 且能 `import json, http.client`；缺 `ssl` 会告警（访问 https 上游需要它）。
-
-- 探测成功 → 路径写进 `python_path.txt`，并打印来源（`缓存` / `自动探测` / `PYTHON 环境变量`）
-- 缓存失效（Termux 重装、Python 升级）→ 自动重新探测并覆盖，不会卡住
-- 全部探测不到 → 打印安装与手动指定方法后退出，不会静默失败
-- 目录只读写不进缓存 → 只警告，本次照样能跑
-- 想手写也行：`python_path.txt` 支持单行路径、`python=/path/to/python3` 和 `#` 注释
-
-启动后会打印：
+启动成功会打印：
 
 ```
-局域网: http://192.168.x.x:17392/v1
+✓ Python 3.12.15  /usr/local/bin/python3  [自动探测]
+  已写入 python_path.txt
+[20:12:37] sta1n-free-proxy v1.0.0 监听 0.0.0.0:17392
+[20:12:37] 本地:   http://127.0.0.1:17392/v1
+[20:12:37] 局域网: http://192.168.1.236:17392/v1
 ```
 
-## 客户端怎么填
+记住那个 `局域网` 地址，其它设备连它。
 
-| 项 | 值 |
-|---|---|
-| Base URL | `http://<手机局域网IP>:17392/v1` |
-| API Key | **填你自己的 sta1n key**，会原样转发给上游（服务端不存 key） |
-| Model | `[公益]Gemini`（先 `GET /v1/models` 看当前在架的） |
-
-如果开了本地口令 `PROXY_KEY`，客户端还得带 `X-Proxy-Key: <口令>` 头；客户端不支持自定义头时，把口令填进 API Key 框也行（此时上游 key 必须由服务端 `KEY` / `key.txt` 提供）。
-
-curl 示例：
+### 4. 自检
 
 ```sh
-curl http://192.168.1.236:17392/v1/chat/completions \
-  -H 'Authorization: Bearer sk-你的key' \
+# 服务活着吗
+curl http://127.0.0.1:17392/healthz
+
+# 上游模型列表（换成你自己的 key）
+curl http://127.0.0.1:17392/v1/models \
+  -H 'Authorization: Bearer 你的key'
+
+# 发一条对话
+curl http://127.0.0.1:17392/v1/chat/completions \
+  -H 'Authorization: Bearer 你的key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"[公益]Gemini","max_tokens":512,
        "messages":[{"role":"user","content":"你好"}]}'
 ```
 
-## 变量
+没有 curl 的手机可以用 Termux 的 `pkg install curl`，或者直接用任意客户端 App 测。
+
+---
+
+## 客户端接入
+
+| 配置项 | 填什么 |
+|---|---|
+| Base URL | `http://<手机局域网IP>:17392/v1` |
+| API Key | **你自己的上游 key**（会原样转发，服务端不存） |
+| Model | 先 `GET /v1/models` 看列表，名字要完全一致（方括号也算） |
+
+常见客户端对应字段：
+
+- **OpenAI SDK**：`OpenAI(base_url="http://IP:17392/v1", api_key="你的key")`
+- **ChatBox / LobeChat / NextChat**：设置里找「自定义 API 地址」，末尾要带 `/v1`
+- **OpenWebUI**：`Settings → Connections → OpenAI API Base URL`
+- **Cherry Studio**：`设置 → 模型服务 → 添加 → OpenAI 兼容`
+
+如果开了本地口令 `PROXY_KEY`，还得加请求头 `X-Proxy-Key: <口令>`；客户端不支持自定义头时，把口令填进 API Key 框也能过校验（此时上游 key 必须由服务端 `KEY` 提供）。
+
+---
+
+## 配置项
+
+全部通过环境变量，或写在同目录 `key.txt`：
+
+```sh
+PORT=18000 PROXY_KEY=abc123 sh start.sh
+```
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `PORT` | `17392` | 监听端口，>1024 免 root |
+| `HOST` | `0.0.0.0` | 改 `127.0.0.1` 则只有本机能连 |
 | `KEY_SOURCE` | `auto` | `auto` 客户端优先、没带回落服务端；`client` 只认客户端；`env` 只用服务端 |
-| `KEY` | 空 | 服务端兜底 key，仅 `auto`/`env` 用；`client` 模式下不读 |
-| `HOST` | `0.0.0.0` | `127.0.0.1` 则只本机可访问 |
-| `PORT` | `17392` | 高端口，免 root |
-| `PROXY_KEY` | 空 | 本地口令，靠 `X-Proxy-Key` 头校验，防局域网旁人白蹭 |
-| `RETRY_DELAYS` | `3,6,9,12` | 上游 503/429 退避秒数 |
-| `TIMEOUT` | `600` | 单次上游超时 |
-| `UPSTREAM_BASE` | `https://sta1n.ai/v1` | 换源用 |
+| `KEY` | 空 | 服务端兜底 key，仅 `auto`/`env` 用 |
+| `PROXY_KEY` | 空 | 本地口令，靠 `X-Proxy-Key` 头校验 |
+| `RETRY_DELAYS` | `3,6,9,12` | 重试间隔秒数，逗号分隔 |
+| `TIMEOUT` | `600` | 单次上游请求超时 |
+| `UPSTREAM_BASE` | `https://sta1n.ai/v1` | 换上游用 |
+| `FAKE_ORIGIN` | `https://sta1n156.github.io` | 伪装来源，一般不用改 |
+| `FAKE_REFERER` | `https://sta1n156.github.io/RP-Hub/` | 伪装 Referer |
 | `FAKE_UA` | Android Chrome 142 | 想换 UA 改这个 |
-| `INSECURE_TLS` | 0 | 系统 CA 缺失报 SSL 错时设 1 |
-| `FULL_ERROR` | 0 | 1 = 上游错误体原样透传 |
-| `ALLOW_ANY_PATH` | 0 | 1 = 放开路径白名单 |
+| `INSECURE_TLS` | `0` | 系统 CA 缺失报 SSL 错时设 `1` |
+| `FULL_ERROR` | `0` | `1` = 上游错误体原样透传，不归一化 |
+| `ALLOW_ANY_PATH` | `0` | `1` = 放开路径白名单 |
 
-## 行为说明
+`key.txt` 一行一个 key，支持 `KEY=sk-xxx` 写法，`#` 开头是注释。
 
-- **只透传必需内容**：客户端自带的 Cookie / X-Forwarded-For / UA / Origin 一律丢弃重写；上游的 Set-Cookie、Server、X-New-Api-* 等响应头不回给客户端；错误体默认归一化成 `{"error":{message,type,code}}`。
-- **重试**：429/500/502/503/504 按 3/6/9/12 秒退避，最多 4 次；命中 `model_not_found` / 已下架 不重试，直接返回。
-- **流式**：`stream:true` 的 SSE 逐块透传（chunked），不等整包。
-- **key 走向**：`Authorization` / `X-Upstream-Key` 里的 key 就是上游 key，直接透传；本地口令走 `X-Proxy-Key`，两者不混用。日志只记录 key 来源，不打印 key 本身。
+---
 
-## 注意
+## Python 环境探测
 
-1. 上游把「脱离官方源站调用」列为封号情形，这套头随时可能失效；key 已经在聊天里明文出现过，先轮换。
-2. 别把这套转发放到公网或前端 JS 里，等于公开你的 key。
-3. 图片输入走不通（上游返回 `Unable to process input image`），纯文本正常。
-4. 推理型模型 `max_tokens` 给 ≥256，否则正文可能为空。
+`start.sh` 每次启动按顺序找 Python，找到就缓存进 `python_path.txt`，下次直接用：
+
+1. `PYTHON=/path/to/python3` 环境变量
+2. `python_path.txt` 缓存的路径（会校验能否执行、版本是否 ≥3.8）
+3. 自动探测：PATH 里的 `python3` / `python`，再扫 Termux、MT管理器、Pydroid 等常见安装位置，最后是 `/data/local/tmp`、`/usr/bin`、`/usr/local/bin` 和本目录自带的便携版 `./python3`
+
+相关命令：
+
+```sh
+sh start.sh --detect    # 只探测环境，不启动
+sh start.sh --which     # 看用的哪个 Python、SSL 版本
+sh start.sh --reset     # 清掉缓存重新找
+```
+
+缓存失效（重装 Termux、升级 Python、路径被删）会自动重新探测并覆盖，不会卡在坏路径上。
+
+---
+
+## 工作原理
+
+```
+客户端请求
+   │  Authorization: Bearer <key>
+   ▼
+sta1n_proxy.py
+   │  ┌─ 丢弃客户端的 Cookie / UA / X-Forwarded-For / Origin
+   │  ├─ 补 Origin / Referer / Android Chrome UA / Sec-Fetch-*
+   │  ├─ key 原样带上（或回落服务端）
+   │  └─ 仅在白名单路径上转发
+   ▼
+上游 API
+   │  429 / 503 → 3、6、9、12 秒退避重试
+   │  model_not_found / 已下架 → 立即返回，不重试
+   ▼
+客户端
+   └─ 状态码 + Content-Type 透传，chunked 流式回写
+```
+
+安全边界：
+
+- 客户端的 `Authorization` 永远只作为上游 key，不会用于本地鉴权
+- 上游 `Set-Cookie`、`Server`、`X-New-Api-*` 等响应头不回给客户端
+- 日志只记录 `key=客户端透传` / `key=服务端 KEY`，**从不打印 key 本身**
+- 默认只放行 `/models`、`/chat/completions`、`/completions`、`/embeddings`、`/responses`
+
+---
+
+## 错误排查
+
+### 启动阶段
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `✕ 没找到可用的 Python 3.8+` | 没装 Python 或不在默认位置 | `pkg install python`；或 `PYTHON=/path/to/python3 sh start.sh`；或把路径写进 `python_path.txt` |
+| `⚠ 这个 Python 缺 ssl 模块` | 精简版 Python | 换 Termux 官方 `python` 包，或 `PYTHON=/usr/bin/python3 sh start.sh` |
+| `✕ KEY_SOURCE=env 但没给服务端 key` | 选了服务端 key 模式却没配 | `export KEY=sk-xxx`，或改回 `KEY_SOURCE=auto` |
+| 启动后立刻退出、日志末尾有 `Traceback` | 看日志最后一行异常 | 最常见是端口占用（见下条），其次是 key 配置冲突 |
+| `OSError: [Errno 98] Address already in use` | 端口被别的程序占了 | `PORT=18000 sh start.sh`，或 `sh start.sh --status` 看是不是已经跑着一份 |
+| `Permission denied` 写在 `/sdcard` | exFAT 改了权限位 | 只用 `sh start.sh` 调用，别依赖可执行位 |
+
+### 请求阶段（按状态码）
+
+| 状态码 / 提示 | 含义 | 处理 |
+|---|---|---|
+| `401 缺少上游 key` | 客户端没带 `Authorization` | 在客户端 API Key 里填上游 key |
+| `401 invalid local proxy key` | `X-Proxy-Key` 不对 | 检查口令，或把口令填进 API Key 框 |
+| `401 无效的令牌` | key 错 / 过期 / 已吊销 | 换 key，先在 `/v1/models` 上验证 |
+| `404 path not proxied` | 请求路径不在白名单 | 确认 Base URL 带 `/v1`；确实需要别的接口就设 `ALLOW_ANY_PATH=1` |
+| `400 permission_error` | 上游来源校验没过 | 一般不会出现（请求头已补齐）；检查是否被中间代理改写 |
+| `400 invalid_request` | 参数或模型名错误 | 核对 `model` 名字、JSON 格式、`max_tokens` |
+| `429` | 限流 | 代理会自动退避重试；持续 429 说明配额或频率问题 |
+| `503 当前公益模型并发数较高` | 免费池满了 | 代理自动重试 4 次；仍失败就隔一会儿再试 |
+| `503 model_not_found` / `该模型已下架` | 模型没了，重试无用 | `GET /v1/models` 看现存的，换模型 |
+| `502 upstream unreachable` | 连不上上游（DNS / 网络 / 代理） | 手机能不能直接打开上游站点；必要时配系统代理 |
+| `SSLCertVerificationError` | 系统根证书缺失 | `INSECURE_TLS=1 sh start.sh`（临时），或装 `ca-certificates` |
+
+### 局域网连不上
+
+1. 手机和客户端**必须在同一个 WiFi**（访客网络 / AP 隔离会挡）
+2. 用启动日志里那个 `局域网:` 地址，别用 `127.0.0.1`
+3. 确认没改过 `HOST=127.0.0.1`
+4. 手机上浏览器开 `http://127.0.0.1:17392/healthz` 能通，才说明服务本身没问题
+5. 部分国产 ROM 有「后台省电限制」，会把后台进程杀掉——把 Termux 加到电池白名单，或用 `--bg` 后锁屏前确认进程还在（`sh start.sh --status`）
+
+### 流式没反应 / 一次性吐完
+
+- 客户端要自己开 `stream: true`，服务端只是透传
+- 中间有反向代理（nginx 等）时可能被缓冲，需要关掉 `proxy_buffering`
+- 某些客户端把 SSE 当普通 JSON 解析，看着像"卡住"，其实是客户端不支持
+
+---
+
+## 已知限制
+
+- **不支持图片输入**：上游网关收不了图，会返回 `Unable to process input image`，纯文本正常
+- **推理型模型**：`max_tokens` 建议 ≥256，太低时正文可能为空、思考内容跑到 `reasoning_content`
+- **模型随时变动**：调用前先查 `GET /v1/models`，别把模型名写死在业务里
+- **响应里的 `model` / `provider_model` 会暴露真实上游模型名**，对外展示时注意
+- **上游随时可能改校验**（加签名、改服务端会话），届时本项目会直接失效
+- **单机无连接复用**：每次请求新建上游 TLS 连接，首字延迟多几百毫秒
+
+---
+
+## FAQ
+
+**Q：会不会偷我的 key？**
+A：代码全部公开，服务端只在内存里转发，不写文件、不写日志。可以自己验：
+
+```sh
+grep -n "open(" sta1n_proxy.py     # 只有 load_key 读 key.txt/.env 那一处
+grep -n "print\|log(" sta1n_proxy.py | grep -i key   # 日志里没有 key 变量
+ls -la                              # 跑完不会多出任何文件
+```
+
+**Q：能不能放到公网 VPS 上？**
+A：能跑，但**别裸奔**。至少设 `PROXY_KEY`，前面套 HTTPS 反向代理。否则等于把你的 key 池公开给别人用。
+
+**Q：多个设备能不能共用一把 key？**
+A：可以。`KEY_SOURCE=env` + `KEY=sk-xxx`，客户端 key 随便填；想限制别人用就再设 `PROXY_KEY`。
+
+**Q：为什么端口是 17392？**
+A：高端口免 root，且不容易和其它服务撞。
+
+**Q：支持 `/v1/embeddings`、`/v1/responses` 吗？**
+A：路径白名单里有，能转发；但上游是否实现取决于它自己，返回 404 就是上游没有。
+
+**Q：日志里为什么看不到 key？**
+A：设计如此，只打印 `key=客户端透传` 这类来源标记。
+
+**Q：改了代码怎么生效？**
+A：`sh start.sh --stop` 再 `sh start.sh --bg`。前台模式直接 Ctrl+C 重启。
+
+---
+
+## 项目结构
+
+```
+sta1n-Free-Proxy/
+├── sta1n_proxy.py     # 代理本体，纯标准库
+├── start.sh           # 启动脚本：探测 Python / 读 key / 打印局域网地址
+├── README.md          # 本文档
+├── .gitignore         # 排除 key.txt / .env / 日志 / python_path.txt 等
+├── key.txt            # 可选，服务端兜底 key（不提交）
+└── python_path.txt    # 自动生成，Python 路径缓存（不提交）
+```
+
+---
 
 ## 免责声明 / Disclaimer
 
