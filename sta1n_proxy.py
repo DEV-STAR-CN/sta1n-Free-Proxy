@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sta1n Free Model Proxy  v1.0.1
+sta1n Free Model Proxy  v1.0.2
 纯 Python 标准库实现的 OpenAI 兼容转发服务（Termux / MT管理器 / 任意 Android 环境可跑，不需要 root）
 
 作用：
@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal as _signal
 import socket
 import ssl
 import subprocess
@@ -46,7 +47,7 @@ from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -143,12 +144,53 @@ ALLOWED_PATHS = {
 }
 
 _print_lock = threading.Lock()
+_LOG_FH = None          # 日志文件句柄（始终写）
+_STDERR_OK = True       # 终端日志是否还能写
+_STDERR_IS_TTY = False  # stderr 是不是终端
+
+
+def init_logging() -> None:
+    """日志双路：文件（始终）+ 终端（仅当 stderr 是可写 TTY）。
+
+    这里的每一个 try 都是血的教训：通过 MT 管理器启动时，进程的
+    stdout/stderr 挂在 MT 的 PTY 上。MT 一退出，那个 PTY 就没了，
+    此时写 stderr 会抛 OSError。v1.0.1 及更早版本没有兜底，异常从
+    handler 里逃出去，socketserver 直接关闭连接，客户端就会报
+    "Connection closed before full header was received"。
+    写日志这种副作用，任何情况下都不许影响请求本身。
+    """
+    global _LOG_FH, _STDERR_IS_TTY
+    try:
+        _STDERR_IS_TTY = os.isatty(2)
+    except Exception:
+        _STDERR_IS_TTY = False
+    if env_flag("NO_LOG_FILE"):
+        return
+    path = env("LOG_FILE", os.path.join(HERE, "proxy.log"))
+    try:
+        _LOG_FH = open(path, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        _LOG_FH = None
 
 
 def log(msg: str) -> None:
+    global _STDERR_OK
+    line = "[%s] %s\n" % (time.strftime("%H:%M:%S"), msg)
     with _print_lock:
-        sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
-        sys.stderr.flush()
+        if _LOG_FH is not None:
+            try:
+                _LOG_FH.write(line)
+                _LOG_FH.flush()
+            except Exception:
+                pass
+        if _STDERR_OK and _STDERR_IS_TTY:
+            try:
+                # 先探一下能不能写，避免 PTY 缓冲区满时把请求线程阻塞住
+                if select.select([], [sys.stderr], [], 0)[1]:
+                    sys.stderr.write(line)
+                    sys.stderr.flush()
+            except Exception:
+                _STDERR_OK = False
 
 
 # ---------------------------------------------------------------- 上游连接
@@ -693,6 +735,12 @@ def doctor() -> int:
     print("key 来源  : %s%s" % (KEY_SOURCE, "（服务端已配 key）" if UPSTREAM_KEY else "（无服务端 key，需客户端自带）"))
     print("监听计划  : %s:%d" % (LISTEN_HOST, LISTEN_PORT))
     print("重试间隔  : %s" % (",".join(str(x) for x in RETRY_DELAYS)))
+    try:
+        tty = os.isatty(2)
+    except Exception:
+        tty = False
+    print("终端状态  : stderr %s（%s）" % ("是 TTY" if tty else "非 TTY",
+          "退出终端后日志改走文件，不影响请求" if tty else "日志走文件"))
     print("")
 
     # 端口是否被占
@@ -743,6 +791,13 @@ def doctor() -> int:
 
 
 def main() -> int:
+    init_logging()
+    try:
+        # MT 管理器 / 终端退出会发 SIGHUP，忽略掉，让后台实例继续服务
+        _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+    except Exception:
+        pass
+
     if KEY_SOURCE == "env" and not UPSTREAM_KEY:
         log("ERROR: KEY_SOURCE=env 但服务端没有 key。export KEY=sk-xxx 或放 key.txt")
         return 2
@@ -769,6 +824,9 @@ def main() -> int:
     else:
         log("上游 key: 客户端优先，未带则回落服务端 KEY%s" % ("" if UPSTREAM_KEY else "（当前未配置回落 key）"))
     log("本地口令保护: %s" % ("开启（X-Proxy-Key）" if PROXY_KEY else "关闭"))
+    if _LOG_FH is not None:
+        log("日志文件: %s（MT管理器/Termux 退出后仍会继续写这里）"
+            % env("LOG_FILE", os.path.join(HERE, "proxy.log")))
     try:
         httpd.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:
