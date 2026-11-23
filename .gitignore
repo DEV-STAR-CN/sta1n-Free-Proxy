@@ -1,0 +1,9 @@
+# 本地私密与运行时产物，别提交
+key.txt
+.env
+.gh_token
+python_path.txt
+proxy.log
+proxy.pid
+__pycache__/
+*.pyc
