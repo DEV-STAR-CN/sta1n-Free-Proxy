@@ -9,6 +9,7 @@
 #   sh start.sh --detect   只做环境探测（找 Python 并写入 python_path.txt）
 #   sh start.sh --which    看当前用的是哪个 Python
 #   sh start.sh --reset    删掉缓存的 Python 路径，下次重新探测
+#   sh start.sh --doctor   环境自检（版本/文件完整性/上游连通/回环全链路），不启动服务
 #
 # 可调环境变量（都可省略）:
 #   KEY_SOURCE=auto  上游 key 来源：auto(默认) / client(只认客户端) / env(只用服务端 KEY)
@@ -205,6 +206,10 @@ case "$MODE" in
         echo "环境探测完成，Python 可用：$PY"
         echo "缓存文件：$PYFILE"
         exit 0
+        ;;
+    --doctor|doctor)
+        shift 2>/dev/null || true
+        exec "$PY" -u "$APP" --doctor
         ;;
     --which|which)
         echo "当前使用：$PY"

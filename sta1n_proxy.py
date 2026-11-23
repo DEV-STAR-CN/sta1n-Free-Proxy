@@ -658,6 +658,90 @@ def lan_ip() -> str:
     return ips[0] if ips else "127.0.0.1"
 
 
+def _http_probe(port: int, path: str, timeout: float = 10.0):
+    """用标准库自打一次，返回 (状态码, 前 120 字节, 耗时)。"""
+    import urllib.error
+    import urllib.request
+    url = "http://127.0.0.1:%d%s" % (port, path)
+    headers = {"Content-Length": "0"} if path.startswith("/v1/chat") else {}
+    req = urllib.request.Request(url, data=(b"" if headers else None), headers=headers, method=("POST" if headers else "GET"))
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()[:120], time.time() - t0
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()[:120], time.time() - t0
+    except Exception as e:
+        return 0, ("%s: %s" % (type(e).__name__, e)).encode(), time.time() - t0
+
+
+def doctor() -> int:
+    """环境自检：不启动对外服务，只在本机回环上把整条链路跑一遍。"""
+    print("=== sta1n-free-proxy doctor ===")
+    print("版本      : %s" % __version__)
+    print("Python    : %s" % sys.version.split()[0])
+    print("解释器    : %s" % sys.executable)
+    me = os.path.abspath(__file__)
+    try:
+        raw = open(me, "rb").read()
+        nul = raw.count(b"\x00")
+        state = "OK" if nul == 0 and len(raw) > 1000 else "损坏（重新拉取）"
+        print("脚本文件  : %s  %d 字节  NUL=%d  %s" % (me, len(raw), nul, state))
+    except OSError as e:
+        print("脚本文件  : 读不到 -> %s" % e)
+    print("上游      : %s" % UPSTREAM_BASE)
+    print("key 来源  : %s%s" % (KEY_SOURCE, "（服务端已配 key）" if UPSTREAM_KEY else "（无服务端 key，需客户端自带）"))
+    print("监听计划  : %s:%d" % (LISTEN_HOST, LISTEN_PORT))
+    print("重试间隔  : %s" % (",".join(str(x) for x in RETRY_DELAYS)))
+    print("")
+
+    # 端口是否被占
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(1)
+    busy = probe.connect_ex(("127.0.0.1", LISTEN_PORT)) == 0
+    probe.close()
+    print("端口 %d : %s" % (LISTEN_PORT, "已有服务在监听（可能正在跑）" if busy else "空闲"))
+
+    # 上游连通性
+    print("")
+    print("--- 上游连通性 ---")
+    try:
+        c = upstream_open("GET", "/models", None, UPSTREAM_KEY or "sk-doctor-probe")
+        code = c[1].status
+        try:
+            c[1].read()
+        except Exception:
+            pass
+        c[0].close()
+        print("  可达      : 是（HTTP %d）%s" % (code, "，key 有效" if code == 200 else "，key 无效或未配（正常）"))
+    except Exception as e:
+        print("  可达      : 否 -> %s: %s" % (type(e).__name__, e))
+        print("  提示      : 检查手机网络，或 INSECURE_TLS=1 重试")
+
+    # 回环全链路
+    print("")
+    print("--- 本机回环全链路 ---")
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    except OSError as e:
+        print("  起服务失败: %s" % e)
+        return 1
+    httpd.daemon_threads = True
+    port = httpd.server_address[1]
+    th = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+    th.start()
+    try:
+        code, body, cost = _http_probe(port, "/healthz")
+        print("  /healthz  : %d  %.2fs  %s" % (code, cost, body[:80].decode("utf-8", "replace")))
+        code, body, cost = _http_probe(port, "/v1/models", timeout=20)
+        print("  /v1/models: %d  %.2fs  %s" % (code, cost, body[:110].decode("utf-8", "replace")))
+        print("  结论      : %s" % ("回环链路正常，代理本身没问题" if code in (200, 401, 403, 429, 503) else "回环链路异常，请看上面的状态码"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    return 0
+
+
 def main() -> int:
     if KEY_SOURCE == "env" and not UPSTREAM_KEY:
         log("ERROR: KEY_SOURCE=env 但服务端没有 key。export KEY=sk-xxx 或放 key.txt")
@@ -695,4 +779,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--doctor" in sys.argv[1:]:
+        sys.exit(doctor())
     sys.exit(main())
