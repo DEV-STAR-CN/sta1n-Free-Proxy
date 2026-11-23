@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sta1n Free Model Proxy  v1.0.0
+sta1n Free Model Proxy  v1.0.1
 纯 Python 标准库实现的 OpenAI 兼容转发服务（Termux / MT管理器 / 任意 Android 环境可跑，不需要 root）
 
 作用：
@@ -23,7 +23,7 @@ sta1n Free Model Proxy  v1.0.0
   FAKE_ORIGIN     默认 https://sta1n156.github.io
   FAKE_REFERER    默认 https://sta1n156.github.io/RP-Hub/
   FAKE_UA         默认现代 Android Chrome UA
-  RETRY_DELAYS    退避秒数，默认 3,6,9,12
+  RETRY_DELAYS    退避秒数，默认 2,4,8
   TIMEOUT         单次上游超时秒数，默认 600
   FULL_ERROR      1 = 上游错误体原样透传；默认归一化成 OpenAI error 结构
   INSECURE_TLS    1 = 跳过证书校验（系统 CA 缺失时用）
@@ -34,17 +34,19 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import socket
 import ssl
 import subprocess
 import sys
+import traceback
 import threading
 import time
 from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -120,7 +122,7 @@ INSECURE_TLS = env_flag("INSECURE_TLS")
 ALLOW_ANY_PATH = env_flag("ALLOW_ANY_PATH")
 MAX_BODY = 32 * 1024 * 1024
 
-RETRY_DELAYS = [3, 6, 9, 12]
+RETRY_DELAYS = [2, 4, 8]
 _raw_delays = env("RETRY_DELAYS", "")
 if _raw_delays.strip():
     try:
@@ -216,7 +218,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self._cors()
         self.end_headers()
-        self.wfile.write(data)
+        self._sent = True
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            log("客户端已断开，响应未送达")
 
     def _err(self, code: int, message: str, etype: str = "proxy_error", ecode: str | None = None) -> None:
         item = {"message": message, "type": etype}
@@ -265,6 +271,67 @@ class Handler(BaseHTTPRequestHandler):
             return client_key, "客户端透传"
         return UPSTREAM_KEY, "服务端 KEY 回落"
 
+    # ---------------- 请求体 / 连接状态
+    def _read_body(self) -> bytes:
+        """读取请求体，兼容 Content-Length 与 Transfer-Encoding: chunked。"""
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            out = []
+            total = 0
+            while True:
+                line = self.rfile.readline(1024)
+                if not line:
+                    break
+                try:
+                    size = int(line.strip().split(b";")[0] or b"0", 16)
+                except ValueError:
+                    raise ValueError("invalid chunk size")
+                if size == 0:
+                    self.rfile.readline(1024)
+                    break
+                total += size
+                if total > MAX_BODY:
+                    raise ValueError("body too large")
+                out.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(out)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return b""
+        if length > MAX_BODY:
+            raise ValueError("body too large")
+        return self.rfile.read(length)
+
+    def _client_gone(self) -> bool:
+        """客户端是否已断开（非阻塞探测，不消费数据）。"""
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if not r:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except Exception:
+            return True
+
+    def _sleep_watching(self, seconds: float) -> bool:
+        """退避等待；期间客户端断开则提前返回 True。"""
+        end = time.time() + seconds
+        while True:
+            if self._client_gone():
+                return True
+            left = end - time.time()
+            if left <= 0:
+                return False
+            time.sleep(min(0.25, left))
+
+    def _fail_safe(self) -> None:
+        """兜底：把未预期异常变成 500 JSON，而不是直接断开连接。"""
+        if getattr(self, "_sent", False):
+            return
+        try:
+            self._err(500, "internal proxy error (see proxy log)", "proxy_error", "internal_error")
+        except Exception:
+            pass
+
     # ---------------- 路由
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -274,6 +341,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        self._sent = False
+        try:
+            self._do_get()
+        except Exception:
+            log("unhandled error on GET %s:\n%s" % (self.path, traceback.format_exc()))
+            self._fail_safe()
+
+    def _do_get(self) -> None:
         path = urlsplit(self.path).path
         if path in ("/", "/healthz", "/health"):
             self._json(
@@ -292,18 +367,24 @@ class Handler(BaseHTTPRequestHandler):
         self._forward("GET", path, None)
 
     def do_POST(self) -> None:
+        self._sent = False
+        try:
+            self._do_post()
+        except Exception:
+            log("unhandled error on POST %s:\n%s" % (self.path, traceback.format_exc()))
+            self._fail_safe()
+
+    def _do_post(self) -> None:
         path = urlsplit(self.path).path
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
+            body = self._read_body()
+        except ValueError as e:
+            self._err(413 if "too large" in str(e) else 400,
+                      "bad request body: %s" % e, "invalid_request_error")
+            return
+        if not body:
             self._err(400, "empty request body", "invalid_request_error")
             return
-        if length > MAX_BODY:
-            self._err(413, "request body too large", "invalid_request_error")
-            return
-        body = self.rfile.read(length)
         self._forward("POST", path, body)
 
     # ---------------- 转发
@@ -344,20 +425,34 @@ class Handler(BaseHTTPRequestHandler):
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 delay = RETRY_DELAYS[min(attempt - 2, len(RETRY_DELAYS) - 1)]
-                log("retry %d/%d after %ss  (upstream busy)" % (attempt - 1, attempts - 1, delay))
-                time.sleep(delay)
+                log("retry %d/%d after %ss [%s]" % (attempt - 1, attempts - 1, delay, model))
+                if self._sleep_watching(delay):
+                    log("%s %s -> 客户端在退避等待中断开，放弃重试 [%s]" % (method, norm, model))
+                    return
             try:
                 conn, resp = upstream_open(method, norm, body, up_key)
-            except (OSError, ssl.SSLError) as e:
+            except Exception as e:
+                # 关键修复：BadStatusLine / IncompleteRead 属于 http.client.HTTPException，
+                # 不继承 OSError。只捕 OSError 会漏掉，handler 崩溃后连接被直接关闭，
+                # 客户端只会看到 "Connection closed before full header was received"。
+                desc = "%s: %s" % (type(e).__name__, e)
+                log("%s %s -> 上游异常 %s [%s]" % (method, norm, desc, model))
                 if attempt < attempts:
-                    log("%s %s -> network error: %s" % (method, norm, e))
+                    if self._client_gone():
+                        log("%s %s -> 客户端已断开，停止重试" % (method, norm))
+                        return
                     continue
-                log("%s %s -> network error: %s" % (method, norm, e))
-                self._err(502, "upstream unreachable: %s" % e, "proxy_error", "upstream_error")
+                self._err(502, "upstream error: %s" % desc, "proxy_error", "upstream_error")
                 return
 
             status = resp.status
             if status in RETRY_STATUS:
+                # 错误体读取加短超时，避免上游 keep-alive 迟迟不关连接时卡到总超时
+                try:
+                    if getattr(conn, "sock", None):
+                        conn.sock.settimeout(min(15, TIMEOUT))
+                except Exception:
+                    pass
                 try:
                     raw = resp.read()
                 except Exception:
@@ -428,7 +523,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self._cors()
         self.end_headers()
-        self.wfile.write(data)
+        self._sent = True
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            log("客户端已断开，响应未送达")
 
     def _relay_stream(self, conn, resp) -> None:
         """成功响应：流式透传原始字节（models 列表 / JSON / SSE 都一样处理）。"""
@@ -451,6 +550,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.close_connection = True
         self.end_headers()
+        self._sent = True
         try:
             while True:
                 chunk = resp.read1(65536)
@@ -467,7 +567,22 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             log("client disconnected mid-stream")
         except Exception as e:
-            log("stream aborted: %s" % e)
+            log("stream aborted: %s: %s" % (type(e).__name__, e))
+            # 200 头已经发出去了，只能补一个 SSE 错误事件收尾，
+            # 否则客户端只会看到"流突然结束"，误以为是网络抖动。
+            try:
+                ev = ("data: " + json.dumps(
+                    {"error": {"message": "upstream stream aborted: %s" % e,
+                               "type": "proxy_error", "code": "stream_aborted"}},
+                    ensure_ascii=False) + "\n\n").encode("utf-8")
+                if use_chunked:
+                    self.wfile.write(b"%x\r\n" % len(ev) + ev + b"\r\n")
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.wfile.write(ev)
+                self.wfile.flush()
+            except Exception:
+                pass
         finally:
             try:
                 conn.close()

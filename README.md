@@ -47,7 +47,9 @@ POST /v1/chat/completions → 转发（含流式 SSE），自动补齐上游要�
 - **零依赖**：只用 `http.server` / `http.client` / `ssl`，不需要 pip install
 - **免 root**：监听高端口，普通用户即可运行
 - **key 透传**：客户端 `Authorization` 里的 key 直接转发上游，服务端不落盘
-- **退避重试**：429/500/502/503/504 按 3/6/9/12 秒重试，`model_not_found` 立即失败不浪费次数
+- **退避重试**：429/500/502/503/504 按 2/4/8 秒重试（共 3 次），`model_not_found` 立即失败不浪费次数
+- **重试可中断**：退避等待期间一旦检测到客户端断开就立即放弃，不空转
+- **异常兜底**：上游返回不规范响应（`BadStatusLine` 等）也会转成 502 JSON，不会把连接直接掐掉
 - **流式支持**：`stream:true` 的 SSE 逐块透传（chunked），不等整包
 - **路径白名单**：只转发必要接口，其它一律 404
 - **响应头清洗**：上游的 `Set-Cookie`、`Server`、`X-New-Api-*` 等不留痕
@@ -167,7 +169,7 @@ PORT=18000 PROXY_KEY=abc123 sh start.sh
 | `KEY_SOURCE` | `auto` | `auto` 客户端优先、没带回落服务端；`client` 只认客户端；`env` 只用服务端 |
 | `KEY` | 空 | 服务端兜底 key，仅 `auto`/`env` 用 |
 | `PROXY_KEY` | 空 | 本地口令，靠 `X-Proxy-Key` 头校验 |
-| `RETRY_DELAYS` | `3,6,9,12` | 重试间隔秒数，逗号分隔 |
+| `RETRY_DELAYS` | `2,4,8` | 重试间隔秒数，逗号分隔（默认共 3 次重试） |
 | `TIMEOUT` | `600` | 单次上游请求超时 |
 | `UPSTREAM_BASE` | `https://sta1n.ai/v1` | 换上游用 |
 | `FAKE_ORIGIN` | `https://sta1n156.github.io` | 伪装来源，一般不用改 |
@@ -266,6 +268,15 @@ sta1n_proxy.py
 3. 确认没改过 `HOST=127.0.0.1`
 4. 手机上浏览器开 `http://127.0.0.1:17392/healthz` 能通，才说明服务本身没问题
 5. 部分国产 ROM 有「后台省电限制」，会把后台进程杀掉——把 Termux 加到电池白名单，或用 `--bg` 后锁屏前确认进程还在（`sh start.sh --status`）
+
+### 客户端报 `Connection closed before full header was received`
+
+这条是**客户端**抛的（典型于 Dart/Flutter 系 App），含义是「还没收到响应头连接就断了」。常见两种来源：
+
+1. **上游给了不规范响应**（状态行乱码、半截响应、连接被中间设备掐断）——v1.0.1 之前这种异常没被捕获，handler 直接崩溃导致断连。现已转成 `502` + `{"error":{"message":"upstream error: ..."}}`
+2. **客户端自己超时/主动断开**——比如 App 设了 20 秒超时，而代理正在退避重试。v1.0.1 起退避期间会探测断开并提前停止，日志会写 `客户端在退避等待中断开，放弃重试`
+
+排查顺序：先看 `proxy.log` 最后几行有没有 `上游异常 xxx` 或 `未捕获异常` 的 traceback；再把 `RETRY_DELAYS` 调短（如 `1,2`）试试能否绕过客户端超时。
 
 ### 流式没反应 / 一次性吐完
 
